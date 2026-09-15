@@ -7,7 +7,8 @@ import {
   parseLrc,
   isStreamExpired
 } from 'musicstream-sdk';
-import { Parser, Log } from 'youtubei.js';
+import { Innertube, UniversalCache, Parser, Log } from 'youtubei.js';
+import cookieParser from 'cookie-parser';
 
 // Suppress benign youtubei.js parser warnings (e.g. Message node instead of SectionList/MusicQueue/RichGrid on empty searches)
 Log.setLevel(Log.Level.ERROR);
@@ -28,9 +29,125 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json());
+app.use(cookieParser());
 
-// Initialize MusicKit instance
-const kit = new MusicKit();
+const CLIENT_ID = '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com';
+const CLIENT_SECRET = 'SboVhoG9s0rNafixCSGGKXAT';
+
+/**
+ * Helper to set a secure cross-site, partitioned HTTP-only cookie
+ */
+function setAuthCookie(res: express.Response, creds: any) {
+  res.cookie('yt_creds', JSON.stringify(creds), {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    partitioned: true,
+    maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
+  });
+}
+
+/**
+ * Extract OAuth credentials from request supporting:
+ * 1. Custom 'x-yt-creds' header (localStorage fallback in iframes)
+ * 2. 'yt_creds' HTTP-only cookie
+ * 3. 'Authorization: Bearer <token>' header
+ */
+async function getCredentialsFromReq(req: express.Request): Promise<any | null> {
+  // 1. Check custom header (from client localStorage)
+  if (req.headers['x-yt-creds']) {
+    try {
+      const raw = req.headers['x-yt-creds'] as string;
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.access_token) {
+        return parsed;
+      }
+    } catch {}
+  }
+
+  // 2. Check cookies
+  if (req.cookies?.yt_creds) {
+    try {
+      const raw = typeof req.cookies.yt_creds === 'string'
+        ? JSON.parse(req.cookies.yt_creds)
+        : req.cookies.yt_creds;
+      if (raw && raw.access_token) {
+        return raw;
+      }
+    } catch {}
+  }
+
+  // 3. Check Authorization header
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    if (token) {
+      return { access_token: token };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Refresh Google OAuth access token if expired
+ */
+async function refreshCredentials(creds: any): Promise<any> {
+  if (!creds || !creds.refresh_token) return creds;
+  try {
+    const params = new URLSearchParams({
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      refresh_token: creds.refresh_token,
+      grant_type: 'refresh_token'
+    });
+    const response = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+    const data = await response.json();
+    if (data.access_token) {
+      creds.access_token = data.access_token;
+      creds.expires_in = data.expires_in || 3600;
+      creds.expiry_date = Date.now() + (creds.expires_in * 1000);
+      return creds;
+    }
+  } catch (err) {
+    console.warn('Failed to refresh Google OAuth token', err);
+  }
+  return creds;
+}
+
+async function getInnertube(req: express.Request, res?: express.Response) {
+  const yt = await Innertube.create({ client_type: 'WEB_REMIX' as any });
+  let creds = await getCredentialsFromReq(req);
+  if (creds && creds.access_token) {
+    // If token has expired or will expire in the next 60s, refresh it
+    if (creds.expiry_date && Date.now() > creds.expiry_date - 60000 && creds.refresh_token) {
+      creds = await refreshCredentials(creds);
+      if (res && creds) {
+        setAuthCookie(res, creds);
+        res.setHeader('x-refreshed-creds', JSON.stringify(creds));
+      }
+    }
+
+    try {
+      await yt.session.signIn({
+        access_token: creds.access_token,
+        refresh_token: creds.refresh_token,
+        expiry_date: new Date(creds.expiry_date || Date.now() + 3600000).toISOString(),
+        client: { client_id: CLIENT_ID, client_secret: CLIENT_SECRET }
+      });
+    } catch (e) {
+      console.warn('Failed to sign in with credentials in getInnertube', e);
+    }
+  }
+  return yt;
+}
+
+// Global anonymous kit fallback for non-auth requests
+const globalKit = new MusicKit();
 
 // Cache for stream URLs: videoId -> { url, expiresAt, mimeType }
 interface CachedStream {
@@ -149,25 +266,152 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', app: 'YouMusic Fast' });
 });
 
+// Authentication endpoints
+app.get('/api/auth/status', async (req, res) => {
+  try {
+    let creds = await getCredentialsFromReq(req);
+    if (!creds || !creds.access_token) {
+      return res.json({ loggedIn: false });
+    }
+
+    if (creds.expiry_date && Date.now() > creds.expiry_date - 60000 && creds.refresh_token) {
+      creds = await refreshCredentials(creds);
+      setAuthCookie(res, creds);
+    }
+
+    const yt = await Innertube.create({ client_type: 'WEB_REMIX' as any });
+    try {
+      await yt.session.signIn({
+        access_token: creds.access_token,
+        refresh_token: creds.refresh_token,
+        expiry_date: new Date(creds.expiry_date || Date.now() + 3600000).toISOString(),
+        client: { client_id: CLIENT_ID, client_secret: CLIENT_SECRET }
+      });
+    } catch (e) {
+      console.warn('Innertube sign-in check failed during status', e);
+    }
+
+    let accountName = 'Usuario de YouTube';
+    let accountPhoto = '';
+    try {
+      const accountInfo = await yt.account.getInfo();
+      if (accountInfo) {
+        accountName = (accountInfo as any).name?.text || (accountInfo as any).name || accountName;
+        accountPhoto = (accountInfo as any).photo?.[0]?.url || '';
+      }
+    } catch {}
+
+    res.json({
+      loggedIn: true,
+      account: {
+        name: accountName,
+        photo: accountPhoto
+      },
+      credentials: creds
+    });
+  } catch (err: any) {
+    res.json({ loggedIn: false, error: err.message });
+  }
+});
+
+app.post('/api/auth/device-code', async (req, res) => {
+  try {
+    const params = new URLSearchParams({
+      client_id: CLIENT_ID,
+      scope: 'https://www.googleapis.com/auth/youtube'
+    });
+    const response = await fetch('https://oauth2.googleapis.com/device/code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+    res.json(await response.json());
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/poll', async (req, res) => {
+  try {
+    const { device_code } = req.body;
+    const params = new URLSearchParams({
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      device_code,
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code'
+    });
+    
+    const response = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+    
+    const data = await response.json();
+    if (data.error) {
+      return res.status(400).json(data);
+    }
+    
+    // Calculate expiry timestamp
+    data.expiry_date = Date.now() + ((data.expires_in || 3600) * 1000);
+    const creds = {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_in: data.expires_in || 3600,
+      expiry_date: data.expiry_date,
+      client: { client_id: CLIENT_ID, client_secret: CLIENT_SECRET }
+    };
+    
+    // 1. Set HTTP-Only partitioned cookie
+    setAuthCookie(res, creds);
+
+    // 2. Return credentials in response body for client-side localStorage fallback
+    res.json({
+      success: true,
+      credentials: creds,
+      message: 'Autenticación exitosa'
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('yt_creds', {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    partitioned: true
+  });
+  res.json({ success: true, message: 'Sesión cerrada exitosamente' });
+});
+
 // 2. CORS relay for direct InnerTube requests (as specified in architecture)
 app.post('/api/innertube', async (req, res) => {
   try {
     const { endpoint = 'search', body = {} } = req.body;
     const targetUrl = `https://music.youtube.com/youtubei/v1/${endpoint}`;
     
+    const headers: any = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+      'X-Youtube-Client-Name': '67',
+      'X-Youtube-Client-Version': '1.20250219.01.00',
+      'Origin': 'https://music.youtube.com',
+      'Referer': 'https://music.youtube.com/',
+      'Cookie': 'SOCS=CAI; PREF=hl=es&gl=ES',
+      ...(req.headers['x-youtube-cookie'] ? { 'Cookie': `SOCS=CAI; ${req.headers['x-youtube-cookie']}` } : {})
+    };
+
+    const creds = await getCredentialsFromReq(req);
+    if (creds && creds.access_token) {
+      headers['Authorization'] = `Bearer ${creds.access_token}`;
+    }
+
     // Inject SOCS=CAI and language/region preference cookie
     const response = await fetch(targetUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-        'X-Youtube-Client-Name': '67',
-        'X-Youtube-Client-Version': '1.20250219.01.00',
-        'Origin': 'https://music.youtube.com',
-        'Referer': 'https://music.youtube.com/',
-        'Cookie': 'SOCS=CAI; PREF=hl=es&gl=ES',
-        ...(req.headers['x-youtube-cookie'] ? { 'Cookie': `SOCS=CAI; ${req.headers['x-youtube-cookie']}` } : {})
-      },
+      headers,
       body: JSON.stringify({
         context: {
           client: {
@@ -197,6 +441,8 @@ app.get('/api/suggestions', async (req, res) => {
   }
 
   try {
+    const yt = await getInnertube(req);
+    const kit = new MusicKit({}, yt);
     const suggestions = await kit.autocomplete(query);
     res.json(Array.isArray(suggestions) ? suggestions.slice(0, 10) : []);
   } catch (err: any) {
@@ -219,6 +465,8 @@ app.get('/api/search', async (req, res) => {
     if (filter !== 'all') {
       searchOptions.filter = filter;
     }
+    const yt = await getInnertube(req);
+    const kit = new MusicKit({}, yt);
     const rawResults: any = await kit.search(query, searchOptions);
 
     let songList: any[] = [];
@@ -319,16 +567,23 @@ app.get('/api/search', async (req, res) => {
 app.get('/api/radio/:videoId', async (req, res) => {
   const { videoId } = req.params;
   try {
+    const headers: any = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+      'X-Youtube-Client-Name': '67',
+      'X-Youtube-Client-Version': '1.20250219.01.00',
+      'Origin': 'https://music.youtube.com',
+      'Cookie': 'SOCS=CAI; PREF=hl=es&gl=ES'
+    };
+
+    const creds = await getCredentialsFromReq(req);
+    if (creds && creds.access_token) {
+      headers['Authorization'] = `Bearer ${creds.access_token}`;
+    }
+
     const response = await fetch('https://music.youtube.com/youtubei/v1/next', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-        'X-Youtube-Client-Name': '67',
-        'X-Youtube-Client-Version': '1.20250219.01.00',
-        'Origin': 'https://music.youtube.com',
-        'Cookie': 'SOCS=CAI; PREF=hl=es&gl=ES'
-      },
+      headers,
       body: JSON.stringify({
         context: {
           client: {
@@ -375,9 +630,169 @@ app.get('/api/radio/:videoId', async (req, res) => {
   }
 });
 
-// 5. Home / Reproducir recommendations endpoint
+// 5.5 Library & User Actions
+app.post('/api/library/like', async (req, res) => {
+  try {
+    const { videoId } = req.body;
+    const yt = await getInnertube(req);
+    if (!yt.session.logged_in) {
+      return res.status(401).json({ error: 'Not logged in' });
+    }
+    // Toggle like (we'll just use like for now, ideally toggle based on current status)
+    await yt.interact.like(videoId);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/library/dislike', async (req, res) => {
+  try {
+    const { videoId } = req.body;
+    const yt = await getInnertube(req);
+    if (!yt.session.logged_in) return res.status(401).json({ error: 'Not logged in' });
+    await yt.interact.removeRating(videoId);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/library', async (req, res) => {
+  try {
+    const yt = await getInnertube(req, res);
+    
+    let likedMusic: any[] = [];
+    let playlists: any[] = [];
+    
+    if (yt.session.logged_in) {
+      // 1. Fetch Liked Music playlist (ID: 'LM')
+      try {
+        const lmPlaylist = await yt.music.getPlaylist('LM');
+        if (lmPlaylist && (lmPlaylist.items || (lmPlaylist as any).videos)) {
+          const items = lmPlaylist.items || (lmPlaylist as any).videos || [];
+          likedMusic = items.map((item: any) => ({
+            videoId: item.id || item.videoId,
+            title: item.title?.text || item.title || 'Canción',
+            artist: item.authors?.[0]?.name || item.author?.name || 'Artista',
+            album: item.album?.name || 'Me gusta',
+            durationFormatted: item.duration?.text || '0:00',
+            thumbnails: item.thumbnails || (item.thumbnail ? [item.thumbnail] : [])
+          })).filter((s: any) => s.videoId);
+        }
+      } catch (e) {
+        console.warn("Could not fetch LM playlist", e);
+      }
+      
+      // 2. Fetch User's Private & Created Playlists using YouTube Innertube getPlaylists()
+      try {
+        const feed = await yt.getPlaylists();
+        if (feed && feed.playlists) {
+          for (const pl of feed.playlists) {
+            const pid = (pl as any).id || (pl as any).playlist_id;
+            if (pid) {
+              playlists.push({
+                id: pid,
+                playlistId: pid,
+                title: (pl as any).title?.text || (pl as any).title?.toString() || (pl as any).title || 'Playlist de YouTube',
+                itemCount: (pl as any).video_count?.text || (pl as any).video_count || (pl as any).item_count || 0,
+                coverUrl: (pl as any).thumbnails?.[0]?.url || (pl as any).thumbnail?.url || '',
+                thumbnails: (pl as any).thumbnails || ((pl as any).thumbnail ? [(pl as any).thumbnail] : []),
+                isRemote: true
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("Could not fetch via yt.getPlaylists()", e);
+      }
+
+      // 3. Fallback or supplementary: check yt.music.getLibrary() if getPlaylists() returned none
+      if (playlists.length === 0) {
+        try {
+          const lib = await yt.music.getLibrary();
+          if (lib && (lib as any).contents) {
+            for (const section of (lib as any).contents) {
+              const items = (section as any).items || (section as any).contents || [];
+              for (const item of items) {
+                const pid = item.id || item.playlist_id || item.browse_id;
+                if (pid && !playlists.some(p => p.id === pid)) {
+                  playlists.push({
+                    id: pid,
+                    playlistId: pid,
+                    title: item.title?.text || item.title || 'Playlist',
+                    itemCount: item.item_count?.text || item.item_count || item.video_count || 0,
+                    coverUrl: item.thumbnails?.[0]?.url || '',
+                    thumbnails: item.thumbnails || [],
+                    isRemote: true
+                  });
+                }
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("Could not fetch via yt.music.getLibrary()", e);
+        }
+      }
+    }
+    
+    res.json({
+      loggedIn: yt.session.logged_in,
+      likedMusic,
+      playlists
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 5.6 Get Playlist Items (for playing remote or saved playlists)
+app.get('/api/playlist/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const yt = await getInnertube(req, res);
+    
+    let playlist: any;
+    const cleanId = id.startsWith('VL') ? id : `VL${id}`;
+    try {
+      playlist = await yt.music.getPlaylist(cleanId);
+    } catch {
+      try {
+        playlist = await yt.music.getPlaylist(id);
+      } catch {
+        playlist = await yt.getPlaylist(id);
+      }
+    }
+    
+    if (!playlist) {
+      return res.status(404).json({ error: 'Playlist no encontrada' });
+    }
+
+    const rawItems = playlist.items || (playlist as any).videos || [];
+    const songs = rawItems.map((item: any) => ({
+      videoId: item.id || item.videoId || item.video_id,
+      title: item.title?.text || item.title || 'Canción',
+      artist: item.authors?.[0]?.name || item.author?.name || 'Artista',
+      album: item.album?.name || playlist.title || 'Playlist',
+      durationFormatted: item.duration?.text || '0:00',
+      thumbnails: item.thumbnails || (item.thumbnail ? [item.thumbnail] : [])
+    })).filter((s: any) => s.videoId);
+
+    res.json({
+      id,
+      title: playlist.header?.title?.text || playlist.title || 'Playlist',
+      songs
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
 app.get('/api/home', async (req, res) => {
   try {
+    // We can also fetch the actual home feed if logged in, but let's stick to trending search for now for consistency,
+    // or use getHome() if kit supports it. Let's stick to the current search to avoid frontend breakage.
+    const yt = await getInnertube(req);
+    const kit = new MusicKit({}, yt);
     // Perform search for trending music in Spanish & global
     const trendingResults: any = await kit.search('éxitos 2026 trending music', { filter: 'songs' as any });
     
@@ -533,7 +948,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
   try {
     // Attempt resolve with musicstream-sdk
-    const stream = await kit.getStream(videoId, { quality: 'high' });
+    const stream = await globalKit.getStream(videoId, { quality: 'high' });
     if (stream && stream.url) {
       const expiresAt = stream.expiresAt ? stream.expiresAt * 1000 : now + 5.5 * 3600 * 1000;
       streamCache.set(videoId, {
@@ -570,7 +985,7 @@ app.get('/api/stream/:videoId/audio', async (req, res) => {
   let targetUrl = cached?.url;
   if (!targetUrl || (cached?.expiresAt && cached.expiresAt < Date.now())) {
     try {
-      const stream = await kit.getStream(videoId, { quality: 'high' });
+      const stream = await globalKit.getStream(videoId, { quality: 'high' });
       if (stream?.url) {
         targetUrl = stream.url;
         streamCache.set(videoId, {

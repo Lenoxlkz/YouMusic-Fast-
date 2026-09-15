@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Settings } from 'lucide-react';
 import { LiquidNavbar } from './components/LiquidNavbar';
 import { MiniPlayer } from './components/MiniPlayer';
 import { FullscreenPlayer } from './components/FullscreenPlayer';
@@ -8,6 +9,7 @@ import { HomeView } from './components/HomeView';
 import { SearchView } from './components/SearchView';
 import { ExploreView } from './components/ExploreView';
 import { LibraryView } from './components/LibraryView';
+import { SettingsModal } from './components/SettingsModal';
 import { Song, LyricsData, NavigationTab, RepeatMode, UserPlaylist } from './types';
 
 declare global {
@@ -51,6 +53,7 @@ export const App: React.FC = () => {
   const [showFullscreenPlayer, setShowFullscreenPlayer] = useState<boolean>(false);
   const [showLyrics, setShowLyrics] = useState<boolean>(false);
   const [showQueue, setShowQueue] = useState<boolean>(false);
+  const [showSettings, setShowSettings] = useState<boolean>(false);
   const [lyrics, setLyrics] = useState<LyricsData | null>(null);
   const [isLoadingLyrics, setIsLoadingLyrics] = useState<boolean>(false);
 
@@ -616,6 +619,14 @@ export const App: React.FC = () => {
 
       {/* Main Content Area */}
       <main id="main-content-viewport" className="flex-1 relative z-10">
+        <button
+          onClick={() => setShowSettings(true)}
+          className="absolute top-4 right-4 z-50 p-2 sm:p-3 bg-white/5 hover:bg-white/10 text-white rounded-full backdrop-blur-md border border-white/10 transition-all active:scale-95"
+          title="Configuración de Cuenta"
+        >
+          <Settings className="w-5 h-5 sm:w-6 sm:h-6" />
+        </button>
+
         {activeTab === 'play' && (
           <HomeView
             trendingSongs={trendingSongs}
@@ -650,6 +661,7 @@ export const App: React.FC = () => {
             onCreatePlaylist={handleCreatePlaylist}
             onDeletePlaylist={handleDeletePlaylist}
             onPlayPlaylist={handlePlayPlaylist}
+            onOpenSettings={() => setShowSettings(true)}
             currentSongId={currentSong?.videoId}
             isPlaying={isPlaying}
           />
@@ -744,6 +756,11 @@ export const App: React.FC = () => {
         playlists={playlists}
         onCreatePlaylistFromQueue={(name) => handleCreatePlaylist(name, queue)}
         onAddQueueToPlaylist={handleAddQueueToPlaylist}
+      />
+
+      <SettingsModal 
+        isOpen={showSettings} 
+        onClose={() => setShowSettings(false)} 
       />
     </div>
   );

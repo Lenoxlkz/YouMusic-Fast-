@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ChevronDown,
   Play,
@@ -12,9 +12,11 @@ import {
   ListMusic,
   ChevronRight,
   Music2,
+  Star
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Song, LyricsData, RepeatMode } from '../types';
+import { authFetch } from '../lib/auth';
 
 interface FullscreenPlayerProps {
   isOpen: boolean;
@@ -78,6 +80,25 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
 }) => {
   const [isSeeking, setIsSeeking] = useState(false);
   const [seekValue, setSeekValue] = useState(0);
+  const [isLiked, setIsLiked] = useState(false);
+
+  useEffect(() => {
+    setIsLiked(false);
+  }, [currentSong?.videoId]);
+
+  const handleLikeToggle = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!currentSong) return;
+    const newStatus = !isLiked;
+    setIsLiked(newStatus);
+    try {
+      await authFetch(newStatus ? '/api/library/like' : '/api/library/dislike', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ videoId: currentSong.videoId })
+      });
+    } catch (e) {}
+  };
 
   if (!isOpen || !currentSong) return null;
 
@@ -194,22 +215,33 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
           id="fullscreen-player-controls-section"
           className="relative z-10 w-full max-w-lg mx-auto px-6 sm:px-8 pb-6 sm:pb-8 flex flex-col justify-end gap-3.5 sm:gap-4 flex-shrink-0"
         >
-          {/* Song Title & Artist (Excluding heart and 3 dots as requested) */}
-          <div id="fullscreen-metadata" className="text-left">
-            <h2
-              id="fullscreen-song-title"
-              className="text-xl sm:text-2xl font-bold tracking-tight text-white truncate"
-              title={currentSong.title}
+          {/* Song Title & Artist & Like Button */}
+          <div id="fullscreen-metadata" className="flex items-center justify-between text-left">
+            <div className="flex-1 min-w-0 pr-4">
+              <h2
+                id="fullscreen-song-title"
+                className="text-xl sm:text-2xl font-bold tracking-tight text-white truncate"
+                title={currentSong.title}
+              >
+                {currentSong.title}
+              </h2>
+              <p
+                id="fullscreen-song-artist"
+                className="text-sm sm:text-base font-medium text-slate-300 truncate mt-0.5"
+                title={currentSong.artist}
+              >
+                {currentSong.artist}
+              </p>
+            </div>
+            <button
+              onClick={handleLikeToggle}
+              className={`p-2 sm:p-2.5 rounded-full backdrop-blur-md transition-all active:scale-95 ${
+                isLiked ? 'bg-yellow-400/20 text-yellow-400' : 'bg-white/5 text-white/50 hover:text-white hover:bg-white/10'
+              }`}
+              title={isLiked ? "Quitar de me gusta" : "Añadir a me gusta"}
             >
-              {currentSong.title}
-            </h2>
-            <p
-              id="fullscreen-song-artist"
-              className="text-sm sm:text-base font-medium text-slate-300 truncate mt-0.5"
-              title={currentSong.artist}
-            >
-              {currentSong.artist}
-            </p>
+              <Star className={`w-5 h-5 sm:w-6 sm:h-6 transition-all ${isLiked ? 'fill-yellow-400' : ''}`} />
+            </button>
           </div>
 
           {/* Interactive Single-Line Lyric Snippet (Image 2 style) */}
