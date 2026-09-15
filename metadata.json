@@ -1,0 +1,6 @@
+{
+  "name": "YouMusic Fast",
+  "description": "Aplicación web de streaming de YouTube Music con barra de navegación Liquid Glass, acceso InnerTube y letras sincronizadas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
